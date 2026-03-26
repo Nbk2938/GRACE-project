@@ -1,4 +1,13 @@
 outputs_try1/
-Data/
+
+outputs/*.nc
+
+
+Data/*.zip
+Data/*.nc
+Data/*.grib
+Data/*.idx
+
 .venv/
+
 __pycache__/
