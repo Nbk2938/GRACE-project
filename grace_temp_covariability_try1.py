@@ -18,6 +18,7 @@ Install cfgrib via "pip install cfgrib" if it is missing.
 from __future__ import annotations
 
 import argparse
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Tuple
@@ -27,15 +28,17 @@ import numpy as np
 import pandas as pd
 import netCDF4 as nc
 import xarray as xr
+from matplotlib.patches import Rectangle
 from scipy.stats import pearsonr
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 from datetime import datetime
 
+
 # Project-level defaults ----------------------------------------------------
 PROJECT_DIR = Path(__file__).resolve().parent
 DEFAULT_GRACE_FILE = PROJECT_DIR / "Data" / "GRCTellus.JPL.200204_202512.GLO.RL06.3M.MSCNv04CRI.nc"
-DEFAULT_TEMP_FILE = PROJECT_DIR / "Data" / "temp_data.grib"
+DEFAULT_TEMP_FILE = PROJECT_DIR / "Data" / "temp_data.nc"
 DEFAULT_TEMP_VAR = "t2m"  # Update if the GRIB file uses a different short name
 
 # Five coarse Greenland subregions + whole ice sheet bounds (lon_deg, lat_deg)
@@ -82,6 +85,23 @@ def parse_args() -> argparse.Namespace:
         default=36,
         help="Rolling window (months) for co-variability diagnostics",
     )
+    parser.add_argument(
+        "--run-preanalysis-plots",
+        action="store_true",
+        help="Generate additional raw/seasonal pre-analysis figures (disabled by default)",
+    )
+    parser.add_argument(
+        "--clim-ref-start",
+        type=str,
+        default="2004-01",
+        help="Reference-period start (YYYY-MM) for monthly climatology used in anomaly computation",
+    )
+    parser.add_argument(
+        "--clim-ref-end",
+        type=str,
+        default="2009-12",
+        help="Reference-period end (YYYY-MM) for monthly climatology used in anomaly computation",
+    )
     return parser.parse_args()
 
 
@@ -104,14 +124,24 @@ def shift_longitudes_array(lon: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     return lon_shift[sort_idx], sort_idx
 
 
-def monthly_anomalies(series: pd.Series) -> pd.Series:
-    climatology = series.groupby(series.index.month).transform("mean")
-    return series - climatology
+def monthly_anomalies(
+    series: pd.Series,
+    ref_start: str | None = None,
+    ref_end: str | None = None,
+) -> pd.Series:
+    """Remove monthly climatology using optional fixed reference window.
 
-"""def monthly_anomalies(series: pd.Series, ref_start="2004-01", ref_end="2009-12") -> pd.Series:
-    ref = series.loc[ref_start:ref_end]
+    If the requested reference window has no data, falls back to full-series climatology.
+    """
+    series = series.sort_index()
+    ref = series
+    if ref_start is not None or ref_end is not None:
+        ref = series.loc[ref_start:ref_end]
+        if ref.empty:
+            ref = series
     climatology = ref.groupby(ref.index.month).mean()
-    return series - series.index.month.map(climatology)"""
+    month_index = pd.Series(series.index.month, index=series.index)
+    return series - month_index.map(climatology)
 
 
 def area_weighted_mean(da: xr.DataArray) -> xr.DataArray:
@@ -175,7 +205,17 @@ def load_grace_field(path: Path) -> GraceField:
 
 
 def load_temperature_field(path: Path, var: str) -> xr.DataArray:
-    ds = xr.open_dataset(path, engine="cfgrib")
+    suffix = path.suffix.lower()
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=r"Engine 'cfgrib' loading failed:.*",
+            category=RuntimeWarning,
+        )
+        if suffix in {".grib", ".grb"}:
+            ds = xr.open_dataset(path, engine="cfgrib")
+        else:
+            ds = xr.open_dataset(path, engine="netcdf4")
     
     # Rename coordinates if they are full names
     rename_dict = {}
@@ -183,6 +223,8 @@ def load_temperature_field(path: Path, var: str) -> xr.DataArray:
         rename_dict["longitude"] = "lon"
     if "latitude" in ds.coords:
         rename_dict["latitude"] = "lat"
+    if "valid_time" in ds.coords:
+        rename_dict["valid_time"] = "time"
     if rename_dict:
         ds = ds.rename(rename_dict)
         
@@ -196,7 +238,12 @@ def load_temperature_field(path: Path, var: str) -> xr.DataArray:
     return da
 
 
-def build_region_series_grace(field: GraceField, label: str) -> Dict[str, pd.Series]:
+def build_region_series_grace(
+    field: GraceField,
+    label: str,
+    ref_start: str | None = None,
+    ref_end: str | None = None,
+) -> Dict[str, pd.Series]:
     region_series: Dict[str, pd.Series] = {}
     dates = field.dates
     for name, bounds in SUBREGIONS.items():
@@ -223,12 +270,17 @@ def build_region_series_grace(field: GraceField, label: str) -> Dict[str, pd.Ser
         if series.empty:
             continue
         series = series.sort_index()
-        series = monthly_anomalies(series)
+        series = monthly_anomalies(series, ref_start=ref_start, ref_end=ref_end)
         region_series[name] = series.rename(label)
     return region_series
 
 
-def build_region_series_xarray(da: xr.DataArray, label: str) -> Dict[str, pd.Series]:
+def build_region_series_xarray(
+    da: xr.DataArray,
+    label: str,
+    ref_start: str | None = None,
+    ref_end: str | None = None,
+) -> Dict[str, pd.Series]:
     region_series: Dict[str, pd.Series] = {}
     da = da.sortby("time")
     time_start = pd.to_datetime(da.time.min().values)
@@ -241,7 +293,7 @@ def build_region_series_xarray(da: xr.DataArray, label: str) -> Dict[str, pd.Ser
             continue
         series = area_weighted_mean(region_da).to_series()
         series = series.sort_index()
-        series = monthly_anomalies(series)
+        series = monthly_anomalies(series, ref_start=ref_start, ref_end=ref_end)
         region_series[name] = series.rename(label)
     return region_series
 
@@ -413,6 +465,71 @@ def direct_regional_correlation(
     return pd.DataFrame(rows).sort_values("region")
 
 
+def _linear_trend_and_residuals(series: pd.Series) -> tuple[float, pd.Series]:
+    """Return trend slope (per day) and detrended residual series."""
+    s = series.dropna().sort_index()
+    idx = s.index
+    if isinstance(idx, pd.PeriodIndex):
+        idx = idx.to_timestamp()
+    elif not isinstance(idx, pd.DatetimeIndex):
+        idx = pd.to_datetime(idx)
+    t_num = (idx - idx[0]).days.astype(float)
+    slope, intercept = np.polyfit(t_num, s.values, 1)
+    trend = slope * t_num + intercept
+    residual = pd.Series(s.values - trend, index=s.index)
+    return slope, residual
+
+
+def validation_checks(
+    grace_series: Dict[str, pd.Series],
+    temp_series: Dict[str, pd.Series],
+) -> pd.DataFrame:
+    """Per-region validation metrics: trend, raw r, and detrended r."""
+    rows = []
+    for region in SUBREGIONS:
+        if region not in grace_series or region not in temp_series:
+            continue
+        combined = _align_by_month(grace_series[region], temp_series[region])
+        if combined.shape[0] < 10:
+            continue
+
+        mass = combined["mass_mm"]
+        temp = combined["temp_degC"]
+
+        raw_r, raw_p = pearsonr(mass, temp)
+
+        mass_slope, mass_resid = _linear_trend_and_residuals(mass)
+        temp_slope, temp_resid = _linear_trend_and_residuals(temp)
+        detrended_r, detrended_p = pearsonr(mass_resid, temp_resid)
+
+        rows.append(
+            {
+                "region": region,
+                "n_months": len(combined),
+                "mass_trend_per_decade_mm": mass_slope * 365.25 * 10,
+                "temp_trend_per_decade_degC": temp_slope * 365.25 * 10,
+                "raw_pearson_r": raw_r,
+                "raw_p_value": raw_p,
+                "detrended_pearson_r": detrended_r,
+                "detrended_p_value": detrended_p,
+            }
+        )
+
+    cols = [
+        "region",
+        "n_months",
+        "mass_trend_per_decade_mm",
+        "temp_trend_per_decade_degC",
+        "raw_pearson_r",
+        "raw_p_value",
+        "detrended_pearson_r",
+        "detrended_p_value",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame(rows)[cols].sort_values("region")
+
+
 # ===================== PLOTTING =====================
 
 
@@ -436,6 +553,106 @@ def plot_raw_timeseries(
     ax.grid(alpha=0.3)
     fig.tight_layout()
     fig.savefig(output_dir / filename, dpi=300)
+    plt.close(fig)
+
+
+def plot_regional_anomaly_timeseries(
+    region_series: Dict[str, pd.Series],
+    title: str,
+    ylabel: str,
+    filename: str,
+    output_dir: Path,
+) -> None:
+    """Plot anomaly series for all regions on one panel."""
+    fig, ax = plt.subplots(figsize=(12, 5))
+    colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    for idx, (name, series) in enumerate(region_series.items()):
+        ax.plot(
+            series.index,
+            series.values,
+            label=name,
+            color=colors[idx % len(colors)],
+            alpha=0.9,
+            linewidth=1.2,
+        )
+    ax.axhline(0, color="k", linewidth=0.7)
+    ax.set_xlabel("Time")
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    ax.legend(loc="best")
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(output_dir / filename, dpi=300)
+    plt.close(fig)
+
+
+def plot_greenland_domain_and_sectors(output_dir: Path) -> None:
+    """Draw Greenland analysis domain and broad sector rectangles."""
+    fig, ax = plt.subplots(figsize=(8.5, 6))
+    ax.set_facecolor("#eaf3ff")
+
+    # Main EOF/PCA analysis domain (same as Greenland bounds in SUBREGIONS).
+    gl = SUBREGIONS["Greenland"]
+    gl_lon_min, gl_lon_max = gl["lon"]
+    gl_lat_min, gl_lat_max = gl["lat"]
+    gl_rect = Rectangle(
+        (gl_lon_min, gl_lat_min),
+        gl_lon_max - gl_lon_min,
+        gl_lat_max - gl_lat_min,
+        fill=False,
+        linewidth=2.0,
+        edgecolor="black",
+        label="Main EOF domain",
+    )
+    ax.add_patch(gl_rect)
+
+    colors = {
+        "Northwest": "#4c78a8",
+        "Northeast": "#f58518",
+        "Southwest": "#54a24b",
+        "Southeast": "#e45756",
+    }
+    for region in ["Northwest", "Northeast", "Southwest", "Southeast"]:
+        lon_min, lon_max = SUBREGIONS[region]["lon"]
+        lat_min, lat_max = SUBREGIONS[region]["lat"]
+        rect = Rectangle(
+            (lon_min, lat_min),
+            lon_max - lon_min,
+            lat_max - lat_min,
+            facecolor=colors[region],
+            edgecolor="white",
+            linewidth=1.6,
+            alpha=0.33,
+            label=region,
+        )
+        ax.add_patch(rect)
+        ax.text(
+            (lon_min + lon_max) / 2,
+            (lat_min + lat_max) / 2,
+            region,
+            ha="center",
+            va="center",
+            fontsize=10,
+            color="black",
+            weight="bold",
+        )
+
+    ax.set_xlim(-82, -6)
+    ax.set_ylim(56, 87)
+    ax.set_xlabel("Longitude (deg)")
+    ax.set_ylabel("Latitude (deg)")
+    ax.set_title("Greenland main EOF domain and broad comparison sectors")
+    ax.grid(alpha=0.25)
+
+    handles, labels = ax.get_legend_handles_labels()
+    uniq = {}
+    for h, l in zip(handles, labels):
+        if l not in uniq:
+            uniq[l] = h
+    ax.legend(uniq.values(), uniq.keys(), loc="upper right", fontsize=8, framealpha=0.9)
+
+    fig.tight_layout()
+    fig.savefig(output_dir / "greenland_domain_and_sectors.png", dpi=300)
     plt.close(fig)
 
 
@@ -549,17 +766,100 @@ def plot_annual_mean(
 
 
 def plot_scree(pca: PCA, label: str, output_dir: Path) -> None:
-    """Scree plot: explained variance ratio per component."""
+    """Explained and cumulative variance plot for PCA components."""
     n = len(pca.explained_variance_ratio_)
-    fig, ax = plt.subplots(figsize=(6, 4))
-    ax.bar(range(1, n + 1), pca.explained_variance_ratio_ * 100, color="steelblue")
+    exp_pct = pca.explained_variance_ratio_ * 100
+    cum_pct = np.cumsum(exp_pct)
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    ax.bar(range(1, n + 1), exp_pct, color="steelblue", label="Explained variance")
+    ax.plot(range(1, n + 1), cum_pct, color="darkred", marker="o", label="Cumulative variance")
     ax.set_xlabel("Principal Component")
-    ax.set_ylabel("Explained variance (%)")
-    ax.set_title(f"Scree plot — {label}")
+    ax.set_ylabel("Variance explained (%)")
+    ax.set_title(f"Explained and cumulative variance - {label}")
     ax.set_xticks(range(1, n + 1))
+    ax.set_ylim(0, 105)
+    ax.legend(loc="lower right")
     ax.grid(axis="y", alpha=0.3)
     fig.tight_layout()
     fig.savefig(output_dir / f"scree_{label.lower().replace(' ', '_')}.png", dpi=300)
+    plt.close(fig)
+
+
+def plot_sector_eof_maps(
+    loadings_df: pd.DataFrame,
+    label: str,
+    output_dir: Path,
+    n_modes: int = 3,
+) -> None:
+    """Pseudo-EOF maps: paint each sector rectangle by its loading value."""
+    n_modes = min(n_modes, loadings_df.shape[1])
+    fig, axes = plt.subplots(1, n_modes, figsize=(5 * n_modes, 5), squeeze=False)
+    axes = axes[0]
+
+    v = np.nanmax(np.abs(loadings_df.iloc[:, :n_modes].values))
+    if not np.isfinite(v) or v == 0:
+        v = 1.0
+
+    for k in range(n_modes):
+        ax = axes[k]
+        ax.set_facecolor("#eef5ff")
+        pc_name = loadings_df.columns[k]
+
+        gl = SUBREGIONS["Greenland"]
+        gl_rect = Rectangle(
+            (gl["lon"][0], gl["lat"][0]),
+            gl["lon"][1] - gl["lon"][0],
+            gl["lat"][1] - gl["lat"][0],
+            fill=False,
+            edgecolor="black",
+            linewidth=1.6,
+        )
+        ax.add_patch(gl_rect)
+
+        for region in ["Northwest", "Northeast", "Southwest", "Southeast", "Greenland"]:
+            if region not in loadings_df.index:
+                continue
+            val = float(loadings_df.loc[region, pc_name])
+            lon_min, lon_max = SUBREGIONS[region]["lon"]
+            lat_min, lat_max = SUBREGIONS[region]["lat"]
+            rect = Rectangle(
+                (lon_min, lat_min),
+                lon_max - lon_min,
+                lat_max - lat_min,
+                facecolor=plt.cm.RdBu_r((val + v) / (2 * v)),
+                edgecolor="white",
+                linewidth=1.0,
+                alpha=0.88 if region != "Greenland" else 0.2,
+            )
+            ax.add_patch(rect)
+            if region != "Greenland":
+                ax.text(
+                    (lon_min + lon_max) / 2,
+                    (lat_min + lat_max) / 2,
+                    f"{region}\n{val:+.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    color="black",
+                )
+
+        ax.set_xlim(-82, -6)
+        ax.set_ylim(56, 87)
+        ax.set_xlabel("Longitude")
+        if k == 0:
+            ax.set_ylabel("Latitude")
+        ax.set_title(f"{pc_name} loading pattern")
+        ax.grid(alpha=0.2)
+
+    norm = plt.Normalize(vmin=-v, vmax=v)
+    sm = plt.cm.ScalarMappable(cmap="RdBu_r", norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes, shrink=0.85, location="right", pad=0.02)
+    cbar.set_label("Loading")
+
+    fig.suptitle(f"Sector EOF loading maps — {label}")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"sector_eof_maps_{label.lower().replace(' ', '_')}.png", dpi=300)
     plt.close(fig)
 
 
@@ -680,6 +980,68 @@ def plot_regional_scatter(
     plt.close(fig)
 
 
+def summarise_pc_temperature_relationships(
+    joined: pd.DataFrame,
+    corr_matrix: pd.DataFrame,
+    lag_series: Dict[Tuple[int, int], pd.Series],
+) -> pd.DataFrame:
+    """Build a trend and correlation summary table for GRACE PCs vs temp PCs."""
+    n_months = joined.shape[0]
+    if n_months < 3:
+        return pd.DataFrame(
+            columns=[
+                "grace_pc",
+                "temp_pc",
+                "n_months",
+                "lag0_r",
+                "max_abs_lag_r",
+                "max_abs_lag_month",
+                "grace_pc_trend_per_decade",
+                "temp_pc_trend_per_decade",
+            ]
+        )
+
+    # Approximate monthly spacing in days for trend scaling.
+    t_days = np.arange(n_months, dtype=float) * 30.4375
+    g_cols = [c for c in joined.columns if c.startswith("g_")]
+    t_cols = [c for c in joined.columns if c.startswith("t_")]
+
+    g_trend = {}
+    for c in g_cols:
+        slope, _ = np.polyfit(t_days, joined[c].values, 1)
+        g_trend[c] = slope * 365.25 * 10
+
+    t_trend = {}
+    for c in t_cols:
+        slope, _ = np.polyfit(t_days, joined[c].values, 1)
+        t_trend[c] = slope * 365.25 * 10
+
+    rows = []
+    for i in range(corr_matrix.shape[0]):
+        for j in range(corr_matrix.shape[1]):
+            s_lag = lag_series[(i, j)]
+            max_lag_month = int(s_lag.abs().idxmax())
+            max_lag_r = float(s_lag.loc[max_lag_month])
+            g_name = f"g_PC{i+1}"
+            t_name = f"t_PC{j+1}"
+            rows.append(
+                {
+                    "grace_pc": f"PC{i+1}",
+                    "temp_pc": f"PC{j+1}",
+                    "n_months": n_months,
+                    "lag0_r": float(corr_matrix.iloc[i, j]),
+                    "max_abs_lag_r": max_lag_r,
+                    "max_abs_lag_month": max_lag_month,
+                    "grace_pc_trend_per_decade": g_trend.get(g_name, np.nan),
+                    "temp_pc_trend_per_decade": t_trend.get(t_name, np.nan),
+                }
+            )
+
+    out = pd.DataFrame(rows)
+    out = out.sort_values("lag0_r", key=np.abs, ascending=False)
+    return out
+
+
 # ===================== MAIN =====================
 
 
@@ -693,27 +1055,30 @@ def main() -> None:
     Analysis pipeline
     -----------------
     After loading and preprocessing (area-weighted monthly anomalies for
-    5 Greenland subregions), the analysis proceeds in 4 steps:
+    5 Greenland subregions), the analysis proceeds in 5 steps:
 
-    Step 1 — PCA on GRACE subregional mass anomalies
+    Step 1 — Prepare GRACE matrix
+        Remove monthly climatology (default reference period: 2004-01 to
+        2009-12), then stack subregional anomalies into a T x R matrix.
+
+    Step 2 — PCA on GRACE subregional mass anomalies
         Decompose the (T × 5) matrix of regional mass anomalies into
         principal components.  This reveals the dominant *spatial modes*
         of mass variability (e.g. uniform loss vs. NW-SE contrast).
 
-    Step 2 — PCA on temperature subregional anomalies
+    Step 3 — PCA on temperature subregional anomalies
         Same decomposition for temperature.  Identifies leading modes of
         regional warming (e.g. coherent warming vs. coastal gradients).
 
-    Step 3 — Cross-correlation of GRACE and temperature PC time series
+    Step 4 — Cross-correlation of GRACE and temperature PC time series
         Correlate GRACE PC_k with Temp PC_j at lag 0 and at lags up to
         ±12 months.  Strong correlations indicate that a particular
         spatial mode of mass change is driven by / co-varies with a
         particular spatial mode of warming.
 
-    Step 4 — Direct per-region correlation
-        Simple Pearson r between mass and temperature for each subregion.
-        Complements PCA: shows which individual regions exhibit the
-        strongest mass–temperature coupling.
+    Step 5 — Validate and test
+        Report per-region linear trends and both raw and detrended
+        correlations to test whether coupling remains after trend removal.
     """
 
     # ── Load data ──────────────────────────────────────────────────────
@@ -729,8 +1094,18 @@ def main() -> None:
     # Each dict maps region name → pd.Series of monthly anomalies
     #   grace_regions : mm w.e., seasonal cycle removed (full-period climatology)
     #   temp_regions  : °C,      seasonal cycle removed (full-period climatology)
-    grace_regions = build_region_series_grace(grace_field, "mass_mm")
-    temp_regions = build_region_series_xarray(temp_field, "temp_degC")
+    grace_regions = build_region_series_grace(
+        grace_field,
+        "mass_mm",
+        ref_start=args.clim_ref_start,
+        ref_end=args.clim_ref_end,
+    )
+    temp_regions = build_region_series_xarray(
+        temp_field,
+        "temp_degC",
+        ref_start=args.clim_ref_start,
+        ref_end=args.clim_ref_end,
+    )
 
     # Also build raw (non-anomaly) series for descriptive plots
     grace_raw = build_region_series_grace_raw(grace_field, "mass_mm")
@@ -739,84 +1114,107 @@ def main() -> None:
     print(f"GRACE regions: {list(grace_regions.keys())}")
     print(f"Temp  regions: {list(temp_regions.keys())}")
 
-    # ── Pre-analysis: descriptive plots of raw data ────────────────────
-    print("\n=== Pre-analysis: Raw data overview ===")
+    # Figure target: Greenland map with main domain and broad sectors
+    plot_greenland_domain_and_sectors(args.output_dir)
 
-    # 1) All regions on one panel
-    plot_raw_timeseries(
-        temp_raw,
-        "Mean monthly temperature by region",
-        "Temperature (°C)",
-        "raw_temp_timeseries.png",
-        args.output_dir,
-    )
-    plot_raw_timeseries(
-        grace_raw,
-        "GRACE liquid water equivalent thickness by region",
-        "LWE thickness (mm)",
-        "raw_grace_timeseries.png",
+    # ── Pre-analysis: descriptive plots of raw data (optional) ─────────
+    if args.run_preanalysis_plots:
+        print("\n=== Pre-analysis: Raw data overview ===")
+
+        # 1) All regions on one panel
+        plot_raw_timeseries(
+            temp_raw,
+            "Mean monthly temperature by region",
+            "Temperature (°C)",
+            "raw_temp_timeseries.png",
+            args.output_dir,
+        )
+        plot_raw_timeseries(
+            grace_raw,
+            "GRACE liquid water equivalent thickness by region",
+            "LWE thickness (mm)",
+            "raw_grace_timeseries.png",
+            args.output_dir,
+        )
+
+        # 2) Individual subplots with trend lines
+        plot_raw_timeseries_subplots(
+            temp_raw,
+            "Temperature trend by region",
+            "Temperature (°C)",
+            "raw_temp_trends.png",
+            args.output_dir,
+        )
+        plot_raw_timeseries_subplots(
+            grace_raw,
+            "GRACE mass trend by region",
+            "LWE thickness (mm)",
+            "raw_grace_trends.png",
+            args.output_dir,
+        )
+
+        # 3) Seasonal cycles
+        plot_seasonal_cycle(
+            temp_raw,
+            "Mean seasonal cycle - Temperature",
+            "Temperature (°C)",
+            "seasonal_cycle_temp.png",
+            args.output_dir,
+        )
+        plot_seasonal_cycle(
+            grace_raw,
+            "Mean seasonal cycle - GRACE mass",
+            "LWE thickness (mm)",
+            "seasonal_cycle_grace.png",
+            args.output_dir,
+        )
+
+        print("Pre-analysis plots saved.")
+
+    # Figure target: regional temperature anomaly time series
+    plot_regional_anomaly_timeseries(
+        temp_regions,
+        "Regional temperature anomaly time series",
+        "Temperature anomaly (degC)",
+        "regional_temperature_anomaly_timeseries.png",
         args.output_dir,
     )
 
-    # 2) Individual subplots with trend lines
-    plot_raw_timeseries_subplots(
-        temp_raw,
-        "Temperature trend by region",
-        "Temperature (°C)",
-        "raw_temp_trends.png",
-        args.output_dir,
-    )
-    plot_raw_timeseries_subplots(
-        grace_raw,
-        "GRACE mass trend by region",
-        "LWE thickness (mm)",
-        "raw_grace_trends.png",
-        args.output_dir,
-    )
-
-    # 3) Seasonal cycles
-    plot_seasonal_cycle(
-        temp_raw,
-        "Mean seasonal cycle — Temperature",
-        "Temperature (°C)",
-        "seasonal_cycle_temp.png",
-        args.output_dir,
-    )
-    plot_seasonal_cycle(
-        grace_raw,
-        "Mean seasonal cycle — GRACE mass",
-        "LWE thickness (mm)",
-        "seasonal_cycle_grace.png",
-        args.output_dir,
-    )
-
-    print("Pre-analysis plots saved.")
-
-    # ── Step 1: PCA on GRACE mass anomalies ────────────────────────────
+    # ── Step 1: prepare GRACE matrix ───────────────────────────────────
     grace_df, grace_dates = build_aligned_matrix(grace_regions)
+    print("\n=== Step 1: Prepare GRACE matrix ===")
+    print(f"GRACE anomaly matrix shape (T x R): {grace_df.shape}")
+    print(
+        "Climatology reference period:",
+        f"{args.clim_ref_start} to {args.clim_ref_end}",
+    )
+
+    # ── Step 2: PCA on GRACE mass anomalies ────────────────────────────
     grace_pca, grace_scores, grace_loadings, _ = run_pca(grace_df)
 
-    print("\n=== Step 1: GRACE PCA ===")
+    print("\n=== Step 2: GRACE PCA ===")
     print("Explained variance ratio:", np.round(grace_pca.explained_variance_ratio_, 4))
     print("Loadings:\n", grace_loadings.round(3))
 
     plot_scree(grace_pca, "GRACE mass", args.output_dir)
     plot_loadings(grace_loadings, "GRACE mass", args.output_dir)
+    plot_sector_eof_maps(grace_loadings, "GRACE mass", args.output_dir, n_modes=3)
     plot_pc_timeseries(grace_scores, grace_dates, "GRACE mass", args.output_dir)
 
-    # ── Step 2: PCA on temperature anomalies ───────────────────────────
+    # ── Step 3: PCA on temperature anomalies ───────────────────────────
     temp_df, temp_dates = build_aligned_matrix(temp_regions)
     temp_pca, temp_scores, temp_loadings, _ = run_pca(temp_df)
 
-    print("\n=== Step 2: Temperature PCA ===")
+    print("\n=== Step 3: Temperature PCA ===")
     print("Explained variance ratio:", np.round(temp_pca.explained_variance_ratio_, 4))
     print("Loadings:\n", temp_loadings.round(3))
 
     plot_scree(temp_pca, "Temperature", args.output_dir)
     plot_loadings(temp_loadings, "Temperature", args.output_dir)
+    plot_sector_eof_maps(temp_loadings, "Temperature", args.output_dir, n_modes=3)
     plot_pc_timeseries(temp_scores, temp_dates, "Temperature", args.output_dir)
 
-    # ── Step 3: Cross-correlation of PC time series ────────────────────
+    # ── Step 4: Cross-correlation of PC time series ────────────────────
     # Align GRACE and temperature PCs to overlapping months.
     # GRACE dates are mid-month, temp dates are 1st-of-month, so we
     # join on year-month period to get exactly matching rows.
@@ -848,7 +1246,7 @@ def main() -> None:
         grace_scores_aligned, temp_scores_aligned, n_pcs=n_pcs, max_lag=12
     )
 
-    print("\n=== Step 3: GRACE PC vs Temperature PC cross-correlation (lag 0) ===")
+    print("\n=== Step 4: GRACE PC vs Temperature PC cross-correlation (lag 0) ===")
     print(corr_matrix.round(3))
 
     plot_cross_corr_matrix(corr_matrix, args.output_dir)
@@ -863,20 +1261,29 @@ def main() -> None:
         for idx in top_indices
     ]
     plot_lag_correlation(lag_series, top_pairs, args.output_dir)
+    pc_link_summary = summarise_pc_temperature_relationships(joined, corr_matrix, lag_series)
+    print("\n=== Step 4b: PC trend and correlation summary ===")
+    print(pc_link_summary.to_string(index=False))
 
-    # ── Step 4: Direct per-region correlation ──────────────────────────
+    # ── Step 5: Validation and tests ───────────────────────────────────
     region_corr = direct_regional_correlation(grace_regions, temp_regions)
+    validation_df = validation_checks(grace_regions, temp_regions)
 
-    print("\n=== Step 4: Direct regional correlation ===")
+    print("\n=== Step 5a: Direct regional correlation ===")
     print(region_corr.to_string(index=False))
 
+    print("\n=== Step 5b: Validation (trend + detrended correlation) ===")
+    print(validation_df.to_string(index=False))
+
     region_corr.to_csv(args.output_dir / "regional_correlation_summary.csv", index=False)
+    validation_df.to_csv(args.output_dir / "validation_trend_detrended_correlation.csv", index=False)
     plot_regional_scatter(grace_regions, temp_regions, args.output_dir)
 
     # ── Save PCA summaries ─────────────────────────────────────────────
     grace_loadings.to_csv(args.output_dir / "grace_pca_loadings.csv")
     temp_loadings.to_csv(args.output_dir / "temp_pca_loadings.csv")
     corr_matrix.to_csv(args.output_dir / "pc_cross_correlation_lag0.csv")
+    pc_link_summary.to_csv(args.output_dir / "pc_trend_correlation_summary.csv", index=False)
 
     pd.DataFrame({
         "PC": [f"PC{i+1}" for i in range(len(grace_pca.explained_variance_ratio_))],
