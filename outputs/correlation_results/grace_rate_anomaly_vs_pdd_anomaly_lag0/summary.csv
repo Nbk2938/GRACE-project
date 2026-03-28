@@ -1,0 +1,2 @@
+target_field,driver_field,common_months,regional_weighted_mean_r,regional_weighted_mean_r2_percent,valid_pixels,significant_pixels_p_lt_0_05,significant_fraction_percent,median_r,median_r2_percent,min_samples
+grace_rate,pdd,285,-0.14494352694492427,3.4673135095304195,2440,1206,49.42622950819672,-0.12290611469620152,1.5110752172847057,24

@@ -1,0 +1,2 @@
+target_field,driver_field,common_months,regional_weighted_mean_r,regional_weighted_mean_r2_percent,valid_pixels,significant_pixels_p_lt_0_05,significant_fraction_percent,median_r,median_r2_percent,min_samples
+grace_rate,temperature,285,0.038355594664022344,1.2690373747827786,2466,639,25.912408759124087,0.056761194361501136,0.8003688713375108,24

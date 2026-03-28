@@ -1,7 +1,10 @@
 outputs_try1/
 
 outputs/*.nc
-
+outputs/**/*.nc
+outputs/**/top_pixels.csv
+outputs/**/best_lag_summary.csv
+outputs/pca_results/*.csv
 
 Data/*.zip
 Data/*.nc

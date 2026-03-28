@@ -114,6 +114,39 @@ def monthly_anomalies(series: pd.Series) -> pd.Series:
     return series - series.index.month.map(climatology)"""
 
 
+def deseasonalize_monthly_field(
+    field: np.ndarray | np.ma.MaskedArray,
+    dates: pd.DatetimeIndex,
+) -> np.ndarray:
+    """Remove monthly climatology from a 3D field (time, lat, lon)."""
+    dates_index = pd.DatetimeIndex(dates)
+    arr = np.asarray(np.ma.filled(field, np.nan), dtype=float)
+    if arr.ndim != 3:
+        raise ValueError("Field must be 3D: (time, lat, lon)")
+    if arr.shape[0] != len(dates_index):
+        raise ValueError(
+            f"Time dimension mismatch: field has {arr.shape[0]} steps, "
+            f"dates has {len(dates_index)}"
+        )
+
+    deseasonalized = np.full_like(arr, np.nan, dtype=float)
+    for month in range(1, 13):
+        month_mask = dates_index.month == month
+        if not np.any(month_mask):
+            continue
+        month_values = arr[month_mask, :, :]
+        valid_count = np.isfinite(month_values).sum(axis=0)
+        month_sum = np.nansum(month_values, axis=0)
+        month_climatology = np.divide(
+            month_sum,
+            valid_count,
+            out=np.full(month_sum.shape, np.nan, dtype=float),
+            where=valid_count > 0,
+        )
+        deseasonalized[month_mask, :, :] = month_values - month_climatology
+    return deseasonalized
+
+
 def area_weighted_mean(da: xr.DataArray) -> xr.DataArray:
     weights = np.cos(np.deg2rad(da["lat"]))
     return da.weighted(weights).mean(("lat", "lon"))
@@ -204,6 +237,94 @@ def load_temperature_field(path: Path, var: str) -> xr.DataArray:
         da.attrs["units"] = "degC"
     da = shift_longitudes_xr(da)
     return da
+
+
+def fill_short_full_missing_grace_months(
+    field: GraceField,
+    max_gap_months: int = 1,
+) -> tuple[GraceField, dict[str, int]]:
+    """Fill only fully-missing GRACE months using time interpolation.
+
+    Behavior:
+    - Reindex to a complete monthly timeline.
+    - Detect runs of fully missing months (all pixels missing).
+    - Fill only runs with length <= ``max_gap_months``; longer runs stay missing.
+    """
+    if max_gap_months < 0:
+        raise ValueError("max_gap_months must be >= 0")
+
+    monthly_dates = pd.DatetimeIndex(field.dates).to_period("M").to_timestamp(how="start")
+    data = np.asarray(np.ma.filled(field.data, np.nan), dtype=float)
+
+    da = xr.DataArray(
+        data,
+        coords={"time": monthly_dates, "lat": field.lat, "lon": field.lon},
+        dims=("time", "lat", "lon"),
+        name="grace_lwe",
+    )
+
+    # In case any duplicate timestamps exist, average them.
+    da = da.groupby("time").mean("time")
+
+    full_months = pd.date_range(
+        start=pd.Timestamp(da.time.values.min()).to_period("M").to_timestamp(how="start"),
+        end=pd.Timestamp(da.time.values.max()).to_period("M").to_timestamp(how="start"),
+        freq="MS",
+    )
+    da = da.reindex(time=full_months)
+
+    full_missing_before = da.isnull().all(dim=("lat", "lon"))
+    full_missing_np = np.asarray(full_missing_before.values, dtype=bool)
+
+    short_gap_mask_np = np.zeros_like(full_missing_np, dtype=bool)
+    run_lengths: list[int] = []
+    idx = 0
+    while idx < full_missing_np.size:
+        if not full_missing_np[idx]:
+            idx += 1
+            continue
+        end_idx = idx
+        while end_idx < full_missing_np.size and full_missing_np[end_idx]:
+            end_idx += 1
+        run_len = end_idx - idx
+        run_lengths.append(run_len)
+        if run_len <= max_gap_months:
+            short_gap_mask_np[idx:end_idx] = True
+        idx = end_idx
+
+    if max_gap_months > 0 and short_gap_mask_np.any():
+        da_interp = da.interpolate_na(
+            dim="time",
+            method="linear",
+        )
+        short_gap_mask = xr.DataArray(
+            short_gap_mask_np,
+            coords={"time": da.time.values},
+            dims=("time",),
+        )
+        da = da.where(~short_gap_mask, da_interp)
+
+    full_missing_after = da.isnull().all(dim=("lat", "lon"))
+
+    stats = {
+        "months_total": int(da.sizes["time"]),
+        "months_full_missing_before": int(full_missing_before.sum().item()),
+        "months_full_missing_after": int(full_missing_after.sum().item()),
+        "months_filled_short_gaps": int(
+            (full_missing_before & ~full_missing_after).sum().item()
+        ),
+        "gap_runs_total": int(len(run_lengths)),
+        "gap_runs_short": int(sum(length <= max_gap_months for length in run_lengths)),
+        "gap_run_max_len": int(max(run_lengths) if run_lengths else 0),
+    }
+
+    processed = GraceField(
+        data=np.ma.masked_invalid(da.values),
+        lat=field.lat,
+        lon=field.lon,
+        dates=pd.DatetimeIndex(da.time.values),
+    )
+    return processed, stats
 
 
 
@@ -322,15 +443,20 @@ class AllData:
     temp_lat: np.ndarray
     temp_lon: np.ndarray
 
+    """temp_anomaly_data: xr.DataArray         # (time, lat, lon) - raw temperature 
+    temp_anomaly_dates: pd.DatetimeIndex
+    temp_anomaly_lat: np.ndarray
+    temp_anomaly_lon: np.ndarray"""
+
     pdd_data: xr.DataArray         # (time, lat, lon) - PDD anomaly
     pdd_dates: pd.DatetimeIndex
     pdd_lat: np.ndarray
     pdd_lon: np.ndarray
 
-    pdd_anomaly_data: xr.DataArray  # (time, lat, lon) - PDD anomaly
+    """pdd_anomaly_data: xr.DataArray  # (time, lat, lon) - PDD anomaly
     pdd_anomaly_dates: pd.DatetimeIndex
     pdd_anomaly_lat: np.ndarray
-    pdd_anomaly_lon: np.ndarray
+    pdd_anomaly_lon: np.ndarray"""
     
     time_range: Tuple[pd.Timestamp, pd.Timestamp]  # common start/end
 
@@ -385,7 +511,7 @@ def load_prepare_data(grace_path: Path, temp_path: Path,temp_var: str = "t2m",) 
 
     This function:
     1. Loads GRACE field with Greenland land mask applied
-    2. Computes monthly PDD and its anomaly (also Greenland-masked)
+    2. Computes monthly mean temperature and monthly PDD (Greenland-masked)
     3. Aligns only the start and end times (keeps all months in between)
     4. Returns gridded data (not flattened) - each dataset keeps its resolution
 
@@ -404,9 +530,25 @@ def load_prepare_data(grace_path: Path, temp_path: Path,temp_var: str = "t2m",) 
 
     print("\n=== Loading GRACE field (Greenland-masked) ===")
     grace_field = load_grace_field(grace_path)
+    grace_field, grace_gap_stats = fill_short_full_missing_grace_months(
+        grace_field,
+        max_gap_months=1,
+    )
     print(f"  GRACE shape: {grace_field.data.shape} (time, lat, lon)")
     print(f"  GRACE time range: {grace_field.dates[0]} to {grace_field.dates[-1]}")
     print(f"  GRACE resolution: {len(grace_field.lat)} lat × {len(grace_field.lon)} lon")
+    print(
+        "  GRACE full-missing months: "
+        f"{grace_gap_stats['months_full_missing_before']} before, "
+        f"{grace_gap_stats['months_filled_short_gaps']} filled (<=1 month), "
+        f"{grace_gap_stats['months_full_missing_after']} remaining"
+    )
+    print(
+        "  Missing-month gap runs: "
+        f"{grace_gap_stats['gap_runs_total']} total, "
+        f"{grace_gap_stats['gap_runs_short']} short (<=1 month), "
+        f"max length {grace_gap_stats['gap_run_max_len']} months"
+    )
 
     print("\n=== Computing gridded monthly PDD ===")
     temp_gridded, pdd_gridded = compute_monthly_pdd_gridded(temp_path, temp_var)
@@ -418,11 +560,6 @@ def load_prepare_data(grace_path: Path, temp_path: Path,temp_var: str = "t2m",) 
     print(f"  PDD resolution: {len(pdd_gridded.lat)} lat × {len(pdd_gridded.lon)} lon")
 
     # PROCESSING AND TIME ALIGNMENT ----------------------------------------------------------
-
-    # Compute PDD anomaly (remove seasonal cycle)
-    pdd_climatology = pdd_gridded.groupby("time.month").mean("time")
-    pdd_anomaly = pdd_gridded.groupby("time.month") - pdd_climatology
-    print("  PDD anomaly computed (seasonal cycle removed)")
 
     # Align only start and end times (keep all months in between, including gaps)
     grace_dates = grace_field.dates
@@ -447,11 +584,9 @@ def load_prepare_data(grace_path: Path, temp_path: Path,temp_var: str = "t2m",) 
     
     temp_subset = temp_gridded.sel(time=slice(common_start, common_end))
     temp_dates_subset = pd.DatetimeIndex(temp_subset.time.values)
+
     pdd_subset = pdd_gridded.sel(time=slice(common_start, common_end))
     pdd_dates_subset = pd.DatetimeIndex(pdd_subset.time.values)
-
-    pdd_anomaly_subset = pdd_anomaly.sel(time=slice(common_start, common_end))
-    pdd_anomaly_dates = pd.DatetimeIndex(pdd_anomaly_subset.time.values)
 
     print(f"  GRACE after trim: {len(grace_dates_subset)} months")
     print(f"  Temperature after trim: {len(temp_dates_subset)} months")
@@ -492,11 +627,6 @@ def load_prepare_data(grace_path: Path, temp_path: Path,temp_var: str = "t2m",) 
         pdd_dates=pdd_dates_subset,
         pdd_lat=pdd_subset.lat.values,
         pdd_lon=pdd_subset.lon.values,
-
-        pdd_anomaly_data=pdd_anomaly_subset,
-        pdd_anomaly_dates=pdd_anomaly_dates,
-        pdd_anomaly_lat=pdd_anomaly_subset.lat.values,
-        pdd_anomaly_lon=pdd_anomaly_subset.lon.values,
 
         time_range=(common_start, common_end),
     )
@@ -655,7 +785,7 @@ def plot_triplet(
 ) -> None:
     """Plot a 3-panel comparison for any selected Greenland fields.
 
-    Valid field names are: "grace", "grace_rate", "temperature", "pdd", "pdd_anomaly".
+    Valid field names are: "grace", "grace_rate", "temperature", "pdd".
     """
 
     try:
@@ -711,16 +841,6 @@ def plot_triplet(
             "label": "PDD (°C·days)",
             "title": "Monthly PDD",
             "symmetric": False,
-        },
-        "pdd_anomaly": {
-            "values": np.asarray(data.pdd_anomaly_data.values),
-            "dates": data.pdd_anomaly_dates,
-            "lat": data.pdd_anomaly_lat,
-            "lon": data.pdd_anomaly_lon,
-            "cmap": "RdBu_r",
-            "label": "PDD anomaly (°C·days)",
-            "title": "Monthly PDD anomaly",
-            "symmetric": True,
         },
     }
 
@@ -885,8 +1005,18 @@ def run_and_plot_pca(
     output_dir: Path,
     n_modes: int = 5,
 ) -> pd.DataFrame:
-    """Run PCA and save one figure with EOF maps + PC time series."""
-    matrix, kept_dates, flat_idx, grid_shape, meta = prepare_pca_inputs(field, dates)
+    """Run PCA and save one figure with EOF maps + PC time series.
+
+    The input field is de-seasonalized internally by removing monthly climatology
+    at each grid cell before PCA.
+    """
+    deseasonalized = deseasonalize_monthly_field(field, dates)
+    matrix, kept_dates, flat_idx, grid_shape, meta = prepare_pca_inputs(
+        deseasonalized,
+        pd.DatetimeIndex(dates),
+    )
+    pca_output_dir = output_dir / "pca_results"
+    pca_output_dir.mkdir(parents=True, exist_ok=True)
 
     lon_arr = np.asarray(lon)
     lat_arr = np.asarray(lat)
@@ -987,10 +1117,10 @@ def run_and_plot_pca(
     fig.tight_layout()
 
     safe_name = name.lower().replace(" ", "_")
-    fig.savefig(output_dir / f"{safe_name}_pca_eof_pc.png", dpi=300, bbox_inches="tight")
+    fig.savefig(pca_output_dir / f"{safe_name}_pca_eof_pc.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(
-        f"  Saved PCA figure for {name}: {output_dir / f'{safe_name}_pca_eof_pc.png'} "
+        f"  Saved PCA figure for {name}: {pca_output_dir / f'{safe_name}_pca_eof_pc.png'} "
         f"(dropped {meta['dropped_months']} months)"
     )
 
@@ -1001,42 +1131,56 @@ def run_and_plot_pca(
             "explained_variance_percent": pca.explained_variance_ratio_ * 100.0,
         }
     )
-    variance_df.to_csv(output_dir / f"{safe_name}_pca_variance.csv", index=False)
+    variance_csv_path = pca_output_dir / f"{safe_name}_pca_variance_explained.csv"
+    variance_df.to_csv(variance_csv_path, index=False)
+    print(f"  Saved PCA variance table for {name}: {variance_csv_path}")
     return variance_df
 
 
 # ===================== ANALYSIS PIPELINE ======================
 
 def run_pca_diagnostics(data: AllData, output_dir: Path, n_modes: int = 5) -> None:
-    """Run PCA diagnostics for GRACE, monthly mean temperature, and PDD anomaly."""
+    """Run PCA diagnostics for raw fields (de-seasonalized inside PCA routine)."""
     print("\n=== PCA diagnostics (first 5 modes) ===")
 
+    run_and_plot_pca(
+        field=data.grace_data,
+        dates=data.grace_dates,
+        lat=data.grace_lat,
+        lon=data.grace_lon,
+        name="GRACE-lwe Anomaly de-seasonalized",
+        cmap="RdBu_r",
+        output_dir=output_dir,
+        n_modes=n_modes,
+    )
     run_and_plot_pca(
         field=data.grace_rate_data,
         dates=data.grace_rate_dates,
         lat=data.grace_rate_lat,
         lon=data.grace_rate_lon,
-        name="GRACE-rate of change",
+        name="GRACE-lwe rate of change de-seasonalized",
         cmap="RdBu_r",
         output_dir=output_dir,
         n_modes=n_modes,
     )
+
     run_and_plot_pca(
         field=data.temp_data.values,
         dates=data.temp_dates,
         lat=data.temp_lat,
         lon=data.temp_lon,
-        name="Monthly Mean Temperature",
+        name="Monthly Mean Temperature de-seasonalized",
         cmap="RdBu_r",
         output_dir=output_dir,
         n_modes=n_modes,
     )
+
     run_and_plot_pca(
         field=data.pdd_data.values,
         dates=data.pdd_dates,
         lat=data.pdd_lat,
         lon=data.pdd_lon,
-        name="Monthly PDD",
+        name="Monthly PDD de-seasonalized",
         cmap="YlOrRd",
         output_dir=output_dir,
         n_modes=n_modes,
@@ -1046,108 +1190,134 @@ def run_pca_diagnostics(data: AllData, output_dir: Path, n_modes: int = 5) -> No
 def run_direct_correlation_grace_rate_pdd(
     data: AllData,
     output_dir: Path,
+    target_field: str = "grace_rate",
+    driver_field: str = "pdd",
     min_samples: int = 24,
 ) -> pd.DataFrame:
-    """Correlate GRACE rate with monthly PDD at lag-0 on a common grid.
+    """Compute lag-0 pixel-wise anomaly correlations for selected target/driver pair.
 
-    Steps:
-    1) Time-align to exact common months (handles GRACE missing months).
-    2) Interpolate PDD from temperature grid to GRACE-rate grid.
-    3) Compute per-pixel Pearson r/p with sample threshold.
-    4) Compute regional area-weighted correlation and save diagnostics.
+    Supported target fields: "grace", "grace_rate"
+    Supported drivers: "temperature", "pdd"
+
+    Regional diagnostics are extrapolated from pixel-wise results.
     """
-    grace_dates = pd.DatetimeIndex(data.grace_rate_dates)
-    pdd_dates = pd.DatetimeIndex(data.pdd_dates)
+    if target_field == "grace":
+        target_raw = np.asarray(np.ma.filled(data.grace_data, np.nan), dtype=float)
+        target_dates = pd.DatetimeIndex(data.grace_dates)
+        target_lat = data.grace_lat
+        target_lon = data.grace_lon
+        target_label = "grace"
+    elif target_field == "grace_rate":
+        target_raw = np.asarray(np.ma.filled(data.grace_rate_data, np.nan), dtype=float)
+        target_dates = pd.DatetimeIndex(data.grace_rate_dates)
+        target_lat = data.grace_rate_lat
+        target_lon = data.grace_rate_lon
+        target_label = "grace_rate"
+    else:
+        raise ValueError(f"Unsupported target_field: {target_field}")
 
-    # Align by calendar month (not exact day), because GRACE timestamps are
-    # typically mid-month while PDD monthly products are month-start.
-    grace_months = grace_dates.to_period("M")
-    pdd_months = pdd_dates.to_period("M")
+    if driver_field == "temperature":
+        driver_raw = np.asarray(data.temp_data.values, dtype=float)
+        driver_dates = pd.DatetimeIndex(data.temp_dates)
+        driver_lat = data.temp_lat
+        driver_lon = data.temp_lon
+        driver_label = "temperature"
+    elif driver_field == "pdd":
+        driver_raw = np.asarray(data.pdd_data.values, dtype=float)
+        driver_dates = pd.DatetimeIndex(data.pdd_dates)
+        driver_lat = data.pdd_lat
+        driver_lon = data.pdd_lon
+        driver_label = "pdd"
+    else:
+        raise ValueError(f"Unsupported driver_field: {driver_field}")
 
-    grace_pos = pd.Series(np.arange(len(grace_months)), index=grace_months)
-    pdd_pos = pd.Series(np.arange(len(pdd_months)), index=pdd_months)
-    grace_pos = grace_pos[~grace_pos.index.duplicated(keep="first")]
-    pdd_pos = pdd_pos[~pdd_pos.index.duplicated(keep="first")]
+    target_anomaly = deseasonalize_monthly_field(target_raw, target_dates)
+    driver_anomaly = deseasonalize_monthly_field(driver_raw, driver_dates)
 
-    common_months = grace_pos.index.intersection(pdd_pos.index)
+    target_months = target_dates.to_period("M")
+    driver_months = driver_dates.to_period("M")
+
+    target_pos = pd.Series(np.arange(len(target_months)), index=target_months)
+    driver_pos = pd.Series(np.arange(len(driver_months)), index=driver_months)
+    target_pos = target_pos[~target_pos.index.duplicated(keep="first")]
+    driver_pos = driver_pos[~driver_pos.index.duplicated(keep="first")]
+
+    common_months = target_pos.index.intersection(driver_pos.index)
     if len(common_months) < min_samples:
         raise ValueError(
             f"Not enough overlapping months for correlation: {len(common_months)} "
             f"(min_samples={min_samples})"
         )
 
-    grace_idx = grace_pos.loc[common_months].to_numpy(dtype=int)
-    pdd_idx = pdd_pos.loc[common_months].to_numpy(dtype=int)
+    target_idx = target_pos.loc[common_months].to_numpy(dtype=int)
+    driver_idx = driver_pos.loc[common_months].to_numpy(dtype=int)
     common_dates = common_months.to_timestamp(how="start")
 
-    grace_common = np.asarray(
-        np.ma.filled(data.grace_rate_data[grace_idx, :, :], np.nan),
-        dtype=float,
-    )
-    grace_da = xr.DataArray(
-        grace_common,
-        coords={"time": common_dates, "lat": data.grace_rate_lat, "lon": data.grace_rate_lon},
-        dims=("time", "lat", "lon"),
-        name="grace_rate",
-    )
+    target_common = target_anomaly[target_idx, :, :]
 
-    pdd_common = data.pdd_data.isel(time=pdd_idx)
-    pdd_common = pdd_common.assign_coords(time=common_dates)
-    pdd_on_grace = pdd_common.interp(
-        lat=data.grace_rate_lat,
-        lon=data.grace_rate_lon,
+    driver_da = xr.DataArray(
+        driver_anomaly[driver_idx, :, :],
+        coords={"time": common_dates, "lat": driver_lat, "lon": driver_lon},
+        dims=("time", "lat", "lon"),
+        name=f"{driver_label}_anomaly",
+    )
+    driver_on_target = driver_da.interp(
+        lat=target_lat,
+        lon=target_lon,
         method="linear",
     )
 
-    grace_flat = grace_common.reshape(len(common_dates), -1)
-    pdd_flat = np.asarray(pdd_on_grace.values, dtype=float).reshape(len(common_dates), -1)
+    target_flat = target_common.reshape(len(common_dates), -1)
+    driver_flat = np.asarray(driver_on_target.values, dtype=float).reshape(len(common_dates), -1)
 
-    n_pixels = grace_flat.shape[1]
+    n_pixels = target_flat.shape[1]
     r_flat = np.full(n_pixels, np.nan, dtype=float)
     p_flat = np.full(n_pixels, np.nan, dtype=float)
     n_flat = np.zeros(n_pixels, dtype=int)
 
     for pixel in range(n_pixels):
-        valid = np.isfinite(grace_flat[:, pixel]) & np.isfinite(pdd_flat[:, pixel])
+        valid = np.isfinite(target_flat[:, pixel]) & np.isfinite(driver_flat[:, pixel])
         n_valid = int(valid.sum())
         n_flat[pixel] = n_valid
         if n_valid < min_samples:
             continue
-        r_val, p_val = pearsonr(grace_flat[valid, pixel], pdd_flat[valid, pixel])
+        r_val, p_val = pearsonr(target_flat[valid, pixel], driver_flat[valid, pixel])
         r_flat[pixel] = r_val
         p_flat[pixel] = p_val
 
-    ny, nx = grace_common.shape[1:]
+    ny, nx = target_common.shape[1:]
     r_map = r_flat.reshape(ny, nx)
     p_map = p_flat.reshape(ny, nx)
     n_map = n_flat.reshape(ny, nx)
     r2_percent_map = (r_map ** 2) * 100.0
 
-    # Regional area-weighted lag-0 correlation on overlapping months
-    grace_reg = area_weighted_mean(grace_da)
-    pdd_reg = area_weighted_mean(pdd_on_grace)
-    reg_df = pd.concat(
-        [
-            pd.Series(grace_reg.values, index=common_dates, name="grace_rate"),
-            pd.Series(pdd_reg.values, index=common_dates, name="pdd"),
-        ],
-        axis=1,
-    ).dropna()
-
-    if len(reg_df) >= min_samples:
-        reg_r, reg_p = pearsonr(reg_df["grace_rate"].values, reg_df["pdd"].values)
-        reg_r2 = reg_r ** 2 * 100.0
-    else:
-        reg_r, reg_p, reg_r2 = np.nan, np.nan, np.nan
+    corr_output_dir = output_dir / "correlation_results" / f"{target_label}_anomaly_vs_{driver_label}_anomaly_lag0"
+    corr_output_dir.mkdir(parents=True, exist_ok=True)
 
     valid_pixels = np.isfinite(r_map)
     sig_pixels = valid_pixels & (p_map < 0.05)
+    weights_1d = np.cos(np.deg2rad(target_lat))
+    weights_2d = np.broadcast_to(weights_1d[:, None], r_map.shape)
+    valid_w = np.where(valid_pixels, weights_2d, np.nan)
+
+    weighted_mean_r = (
+        float(np.nansum(r_map * valid_w) / np.nansum(valid_w))
+        if np.isfinite(valid_w).any()
+        else np.nan
+    )
+    weighted_mean_r2 = (
+        float(np.nansum(r2_percent_map * valid_w) / np.nansum(valid_w))
+        if np.isfinite(valid_w).any()
+        else np.nan
+    )
+
     summary = pd.DataFrame(
         {
+            "target_field": [target_label],
+            "driver_field": [driver_label],
             "common_months": [len(common_dates)],
-            "regional_r": [reg_r],
-            "regional_p": [reg_p],
-            "regional_r2_percent": [reg_r2],
+            "regional_weighted_mean_r": [weighted_mean_r],
+            "regional_weighted_mean_r2_percent": [weighted_mean_r2],
             "valid_pixels": [int(valid_pixels.sum())],
             "significant_pixels_p_lt_0_05": [int(sig_pixels.sum())],
             "significant_fraction_percent": [
@@ -1159,7 +1329,7 @@ def run_direct_correlation_grace_rate_pdd(
         }
     )
 
-    summary.to_csv(output_dir / "grace_rate_vs_pdd_correlation_summary.csv", index=False)
+    summary.to_csv(corr_output_dir / "summary.csv", index=False)
 
     corr_ds = xr.Dataset(
         data_vars={
@@ -1168,9 +1338,9 @@ def run_direct_correlation_grace_rate_pdd(
             "samples_n": (("lat", "lon"), n_map),
             "r2_percent": (("lat", "lon"), r2_percent_map),
         },
-        coords={"lat": data.grace_rate_lat, "lon": data.grace_rate_lon},
+        coords={"lat": target_lat, "lon": target_lon},
     )
-    corr_ds.to_netcdf(output_dir / "grace_rate_vs_pdd_correlation_maps.nc")
+    corr_ds.to_netcdf(corr_output_dir / "maps.nc")
 
     # Compact table for strongest-matching pixels
     top_df = (
@@ -1187,7 +1357,7 @@ def run_direct_correlation_grace_rate_pdd(
         top_df = top_df.merge(p_lookup, on=["lat", "lon"], how="left")
         top_df = top_df.merge(n_lookup, on=["lat", "lon"], how="left")
         top_df = top_df.sort_values("abs_r", ascending=False).head(200)
-        top_df.to_csv(output_dir / "grace_rate_vs_pdd_top_pixels.csv", index=False)
+        top_df.to_csv(corr_output_dir / "top_pixels.csv", index=False)
 
     try:
         import cartopy.crs as ccrs
@@ -1216,7 +1386,7 @@ def run_direct_correlation_grace_rate_pdd(
             "vmin": -1.0,
             "vmax": 1.0,
             "label": "Pearson r",
-            "title": "GRACE-rate vs monthly PDD correlation (lag 0)",
+            "title": f"{target_label} anomaly vs {driver_label} anomaly (lag 0)",
         },
         {
             "ax": axes[1],
@@ -1225,22 +1395,23 @@ def run_direct_correlation_grace_rate_pdd(
             "vmin": 0.0,
             "vmax": 100.0,
             "label": "Variance explained (r², %)",
-            "title": "GRACE-rate vs monthly PDD variance explained",
+            "title": f"{target_label} anomaly vs {driver_label} anomaly variance explained",
         },
     ]
 
     sig_mask = np.isfinite(p_map) & (p_map < 0.05)
-    nonsig_mask = np.isfinite(p_map) & ~sig_mask
-    sig_overlay = np.where(sig_mask, 1.0, np.nan)
-    nonsig_overlay = np.where(nonsig_mask, 1.0, np.nan)
+    r_map_sig = np.where(sig_mask, r_map, np.nan)
+    r2_map_sig = np.where(sig_mask, r2_percent_map, np.nan)
+    panels[0]["field"] = np.ma.masked_invalid(r_map_sig)
+    panels[1]["field"] = np.ma.masked_invalid(r2_map_sig)
 
     for panel in panels:
         ax = panel["ax"]
         if has_cartopy:
             ax.set_extent([-75, -10, 58, 85], crs=ccrs.PlateCarree())
             im = ax.pcolormesh(
-                data.grace_rate_lon,
-                data.grace_rate_lat,
+                target_lon,
+                target_lat,
                 panel["field"],
                 transform=ccrs.PlateCarree(),
                 cmap=panel["cmap"],
@@ -1248,71 +1419,31 @@ def run_direct_correlation_grace_rate_pdd(
                 vmin=panel["vmin"],
                 vmax=panel["vmax"],
             )
-            if np.any(nonsig_mask):
-                ax.contourf(
-                    data.grace_rate_lon,
-                    data.grace_rate_lat,
-                    nonsig_overlay,
-                    levels=[0.5, 1.5],
-                    colors=["lightgray"],
-                    alpha=0.4,
-                    transform=ccrs.PlateCarree(),
-                )
-            if np.any(sig_mask):
-                ax.contourf(
-                    data.grace_rate_lon,
-                    data.grace_rate_lat,
-                    sig_overlay,
-                    levels=[0.5, 1.0],
-                    colors="none",
-                    hatches=["...."],
-                    transform=ccrs.PlateCarree(),
-                )
             ax.add_feature(cfeature.COASTLINE, linewidth=0.7)
             ax.gridlines(alpha=0.3)
         else:
             im = ax.pcolormesh(
-                data.grace_rate_lon,
-                data.grace_rate_lat,
+                target_lon,
+                target_lat,
                 panel["field"],
                 cmap=panel["cmap"],
                 shading="auto",
                 vmin=panel["vmin"],
                 vmax=panel["vmax"],
             )
-            if np.any(nonsig_mask):
-                ax.contourf(
-                    data.grace_rate_lon,
-                    data.grace_rate_lat,
-                    nonsig_overlay,
-                    levels=[0.5, 1.5],
-                    colors=["lightgray"],
-                    alpha=0.4,
-                )
-            if np.any(sig_mask):
-                ax.contourf(
-                    data.grace_rate_lon,
-                    data.grace_rate_lat,
-                    sig_overlay,
-                    levels=[0.5, 1.0],
-                    colors="none",
-                    hatches=["...."],
-                )
             ax.set_aspect("equal")
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")
-        ax.set_title(panel["title"] + "\n(hatched: p < 0.05, gray: non-significant)")
+        ax.set_title(panel["title"] + "\n(only significant pixels shown: p < 0.05)")
         cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.03)
         cbar.set_label(panel["label"])
 
-    fig.savefig(output_dir / "grace_rate_vs_pdd_correlation_maps.png", dpi=300, bbox_inches="tight")
+    fig.savefig(corr_output_dir / "maps.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
     print(
-        "  Saved direct-correlation outputs: "
-        "grace_rate_vs_pdd_correlation_summary.csv, "
-        "grace_rate_vs_pdd_correlation_maps.nc, "
-        "grace_rate_vs_pdd_correlation_maps.png"
+        f"  Saved lag-0 anomaly correlation outputs for {target_label} vs {driver_label}: "
+        f"{corr_output_dir}"
     )
     return summary
 
@@ -1320,81 +1451,107 @@ def run_direct_correlation_grace_rate_pdd(
 def run_lag_analysis_grace_rate_pdd(
     data: AllData,
     output_dir: Path,
+    target_field: str = "grace_rate",
+    driver_field: str = "pdd",
     max_lag: int = 6,
     min_samples: int = 24,
-) -> pd.DataFrame:
-    """Run lagged correlation of GRACE-rate vs monthly PDD.
+):
+    """Run lagged anomaly correlation for selected target/driver pair.
 
-    Lag convention used here:
-    - lag L means corr(PDD_t, GRACE-rate_(t+L)), so PDD leads GRACE-rate.
+    Lag convention:
+    - lag L means corr(driver_t, target_(t+L)), so driver leads target.
+
+    Supported target fields: "grace", "grace_rate"
+    Supported drivers: "temperature", "pdd"
     """
     if max_lag < 0:
         raise ValueError("max_lag must be >= 0")
 
-    grace_dates = pd.DatetimeIndex(data.grace_rate_dates)
-    pdd_dates = pd.DatetimeIndex(data.pdd_dates)
+    if target_field == "grace":
+        target_raw = np.asarray(np.ma.filled(data.grace_data, np.nan), dtype=float)
+        target_dates = pd.DatetimeIndex(data.grace_dates)
+        target_lat = data.grace_lat
+        target_lon = data.grace_lon
+        target_label = "grace"
+    elif target_field == "grace_rate":
+        target_raw = np.asarray(np.ma.filled(data.grace_rate_data, np.nan), dtype=float)
+        target_dates = pd.DatetimeIndex(data.grace_rate_dates)
+        target_lat = data.grace_rate_lat
+        target_lon = data.grace_rate_lon
+        target_label = "grace_rate"
+    else:
+        raise ValueError(f"Unsupported target_field: {target_field}")
 
-    grace_months = grace_dates.to_period("M")
-    pdd_months = pdd_dates.to_period("M")
+    if driver_field == "temperature":
+        driver_raw = np.asarray(data.temp_data.values, dtype=float)
+        driver_dates = pd.DatetimeIndex(data.temp_dates)
+        driver_lat = data.temp_lat
+        driver_lon = data.temp_lon
+        driver_label = "temperature"
+    elif driver_field == "pdd":
+        driver_raw = np.asarray(data.pdd_data.values, dtype=float)
+        driver_dates = pd.DatetimeIndex(data.pdd_dates)
+        driver_lat = data.pdd_lat
+        driver_lon = data.pdd_lon
+        driver_label = "pdd"
+    else:
+        raise ValueError(f"Unsupported driver_field: {driver_field}")
 
-    grace_pos = pd.Series(np.arange(len(grace_months)), index=grace_months)
-    pdd_pos = pd.Series(np.arange(len(pdd_months)), index=pdd_months)
-    grace_pos = grace_pos[~grace_pos.index.duplicated(keep="first")]
-    pdd_pos = pdd_pos[~pdd_pos.index.duplicated(keep="first")]
+    target_anomaly = deseasonalize_monthly_field(target_raw, target_dates)
+    driver_anomaly = deseasonalize_monthly_field(driver_raw, driver_dates)
 
-    common_months = grace_pos.index.intersection(pdd_pos.index)
+    target_months = target_dates.to_period("M")
+    driver_months = driver_dates.to_period("M")
+
+    target_pos = pd.Series(np.arange(len(target_months)), index=target_months)
+    driver_pos = pd.Series(np.arange(len(driver_months)), index=driver_months)
+    target_pos = target_pos[~target_pos.index.duplicated(keep="first")]
+    driver_pos = driver_pos[~driver_pos.index.duplicated(keep="first")]
+
+    common_months = target_pos.index.intersection(driver_pos.index)
     if len(common_months) < (min_samples + max_lag):
         raise ValueError(
             f"Not enough overlapping months for lag analysis: {len(common_months)} "
             f"(need >= {min_samples + max_lag})"
         )
 
-    grace_idx = grace_pos.loc[common_months].to_numpy(dtype=int)
-    pdd_idx = pdd_pos.loc[common_months].to_numpy(dtype=int)
+    target_idx = target_pos.loc[common_months].to_numpy(dtype=int)
+    driver_idx = driver_pos.loc[common_months].to_numpy(dtype=int)
     common_dates = common_months.to_timestamp(how="start")
 
-    grace_common = np.asarray(
-        np.ma.filled(data.grace_rate_data[grace_idx, :, :], np.nan),
-        dtype=float,
-    )
-    grace_da = xr.DataArray(
-        grace_common,
-        coords={"time": common_dates, "lat": data.grace_rate_lat, "lon": data.grace_rate_lon},
+    target_common = target_anomaly[target_idx, :, :]
+    driver_da = xr.DataArray(
+        driver_anomaly[driver_idx, :, :],
+        coords={"time": common_dates, "lat": driver_lat, "lon": driver_lon},
         dims=("time", "lat", "lon"),
-        name="grace_rate",
+        name=f"{driver_label}_anomaly",
     )
-
-    pdd_common = data.pdd_data.isel(time=pdd_idx).assign_coords(time=common_dates)
-    pdd_on_grace = pdd_common.interp(
-        lat=data.grace_rate_lat,
-        lon=data.grace_rate_lon,
+    driver_on_target = driver_da.interp(
+        lat=target_lat,
+        lon=target_lon,
         method="linear",
     )
 
-    grace_flat = grace_common.reshape(len(common_dates), -1)
-    pdd_flat = np.asarray(pdd_on_grace.values, dtype=float).reshape(len(common_dates), -1)
-    n_pixels = grace_flat.shape[1]
+    target_flat = target_common.reshape(len(common_dates), -1)
+    driver_flat = np.asarray(driver_on_target.values, dtype=float).reshape(len(common_dates), -1)
+    n_pixels = target_flat.shape[1]
 
     lags = np.arange(max_lag + 1, dtype=int)
     r_cube = np.full((len(lags), n_pixels), np.nan, dtype=float)
     p_cube = np.full((len(lags), n_pixels), np.nan, dtype=float)
     n_cube = np.zeros((len(lags), n_pixels), dtype=int)
 
-    regional_rows: list[dict[str, float | int]] = []
-    grace_reg = area_weighted_mean(grace_da).to_series()
-    pdd_reg = area_weighted_mean(pdd_on_grace).to_series()
+    lag_rows: list[dict[str, float | int]] = []
+    weights_1d = np.cos(np.deg2rad(target_lat))
+    weights_2d = np.broadcast_to(weights_1d[:, None], (target_common.shape[1], target_common.shape[2]))
 
     for lag_idx, lag in enumerate(lags):
         if lag == 0:
-            x_full = pdd_flat
-            y_full = grace_flat
-            pdd_reg_l = pdd_reg
-            grace_reg_l = grace_reg
+            x_full = driver_flat
+            y_full = target_flat
         else:
-            x_full = pdd_flat[:-lag, :]
-            y_full = grace_flat[lag:, :]
-            pdd_reg_l = pdd_reg.iloc[:-lag]
-            grace_reg_l = grace_reg.iloc[lag:]
+            x_full = driver_flat[:-lag, :]
+            y_full = target_flat[lag:, :]
 
         for pixel in range(n_pixels):
             x = x_full[:, pixel]
@@ -1412,26 +1569,39 @@ def run_lag_analysis_grace_rate_pdd(
             r_cube[lag_idx, pixel] = r_val
             p_cube[lag_idx, pixel] = p_val
 
-        reg_df = pd.concat(
-            [pdd_reg_l.rename("pdd"), grace_reg_l.rename("grace_rate")],
-            axis=1,
-        ).dropna()
-        if len(reg_df) >= min_samples and reg_df["pdd"].std() > 0 and reg_df["grace_rate"].std() > 0:
-            reg_r, reg_p = pearsonr(reg_df["pdd"].values, reg_df["grace_rate"].values)
-            reg_r2 = reg_r ** 2 * 100.0
-        else:
-            reg_r, reg_p, reg_r2 = np.nan, np.nan, np.nan
-        """regional_rows.append(
+        r_map_lag = r_cube[lag_idx, :].reshape(target_common.shape[1], target_common.shape[2])
+        p_map_lag = p_cube[lag_idx, :].reshape(target_common.shape[1], target_common.shape[2])
+        valid_lag = np.isfinite(r_map_lag)
+        sig_lag = valid_lag & (p_map_lag < 0.05)
+        valid_w_lag = np.where(valid_lag, weights_2d, np.nan)
+        weighted_mean_r_lag = (
+            float(np.nansum(r_map_lag * valid_w_lag) / np.nansum(valid_w_lag))
+            if np.isfinite(valid_w_lag).any()
+            else np.nan
+        )
+        lag_rows.append(
             {
+                "target_field": target_label,
+                "driver_field": driver_label,
                 "lag_months": int(lag),
-                "regional_r": reg_r,
-                "regional_p": reg_p,
-                "regional_r2_percent": reg_r2,
-                "regional_n": int(len(reg_df)),
+                "regional_weighted_mean_r": weighted_mean_r_lag,
+                "regional_weighted_mean_r2_percent": weighted_mean_r_lag ** 2 * 100.0
+                if np.isfinite(weighted_mean_r_lag)
+                else np.nan,
+                "valid_pixels": int(valid_lag.sum()),
+                "significant_pixels_p_lt_0_05": int(sig_lag.sum()),
+                "significant_fraction_percent": float(100.0 * sig_lag.sum() / valid_lag.sum())
+                if valid_lag.sum() > 0
+                else np.nan,
+                "median_r": float(np.nanmedian(r_map_lag)) if valid_lag.sum() > 0 else np.nan,
+                "median_r2_percent": float(np.nanmedian((r_map_lag ** 2) * 100.0))
+                if valid_lag.sum() > 0
+                else np.nan,
+                "min_samples": min_samples,
             }
-        )"""
+        )
 
-    ny, nx = grace_common.shape[1:]
+    ny, nx = target_common.shape[1:]
     r_maps = r_cube.reshape(len(lags), ny, nx)
     p_maps = p_cube.reshape(len(lags), ny, nx)
     n_maps = n_cube.reshape(len(lags), ny, nx)
@@ -1458,6 +1628,13 @@ def run_lag_analysis_grace_rate_pdd(
     best_n_map = best_n_flat.reshape(ny, nx)
     best_r2_map = (best_r_map ** 2) * 100.0
 
+    lag_output_dir = (
+        output_dir
+        / "correlation_results"
+        / f"{target_label}_anomaly_vs_{driver_label}_anomaly_lag_analysis_maxlag{max_lag}"
+    )
+    lag_output_dir.mkdir(parents=True, exist_ok=True)
+
     lag_ds = xr.Dataset(
         data_vars={
             "corr_r": (("lag", "lat", "lon"), r_maps),
@@ -1469,26 +1646,13 @@ def run_lag_analysis_grace_rate_pdd(
             "best_samples_n": (("lat", "lon"), best_n_map),
             "best_r2_percent": (("lat", "lon"), best_r2_map),
         },
-        coords={"lag": lags, "lat": data.grace_rate_lat, "lon": data.grace_rate_lon},
+        coords={"lag": lags, "lat": target_lat, "lon": target_lon},
     )
-    lag_ds.to_netcdf(output_dir / "grace_rate_vs_pdd_lag_analysis_maps.nc")
+    lag_ds.to_netcdf(lag_output_dir / "maps.nc")
 
-    #regional_df = pd.DataFrame(regional_rows)
-    #regional_df.to_csv(output_dir / "grace_rate_vs_pdd_lag_analysis_regional.csv", index=False)
+    lag_summary_df = pd.DataFrame(lag_rows)
+    lag_summary_df.to_csv(lag_output_dir / "lag_summary.csv", index=False)
 
-    # Plot regional lag curve
-    """fig, ax = plt.subplots(figsize=(7, 4.5))
-    ax.plot(regional_df["lag_months"], regional_df["regional_r"], marker="o", color="black")
-    ax.axhline(0, color="gray", linewidth=0.8)
-    ax.set_xlabel("Lag (months): PDD leads GRACE-rate")
-    ax.set_ylabel("Regional Pearson r")
-    ax.set_title("Regional lag correlation: GRACE-rate vs monthly PDD")
-    ax.grid(alpha=0.3)
-    fig.tight_layout()
-    fig.savefig(output_dir / "grace_rate_vs_pdd_lag_analysis_regional.png", dpi=300, bbox_inches="tight")
-    plt.close(fig)"""
-
-    # Plot best-lag and best-r maps
     try:
         import cartopy.crs as ccrs
         import cartopy.feature as cfeature
@@ -1529,16 +1693,19 @@ def run_lag_analysis_grace_rate_pdd(
         },
     ]
 
-    sig_best = np.isfinite(best_p_map) & (best_p_map < 0.05)
-    sig_overlay = np.where(sig_best, 1.0, np.nan)
+    sig_mask = np.isfinite(best_p_map) & (best_p_map < 0.05)
+    best_lag_map_sig = np.where(sig_mask, best_lag_map, np.nan)
+    best_r_map_sig = np.where(sig_mask, best_r_map, np.nan)
+    panels[0]["field"] = np.ma.masked_invalid(best_lag_map_sig)
+    panels[1]["field"] = np.ma.masked_invalid(best_r_map_sig)
 
     for panel in panels:
         ax = panel["ax"]
         if has_cartopy:
             ax.set_extent([-75, -10, 58, 85], crs=ccrs.PlateCarree())
             im = ax.pcolormesh(
-                data.grace_rate_lon,
-                data.grace_rate_lat,
+                target_lon,
+                target_lat,
                 panel["field"],
                 transform=ccrs.PlateCarree(),
                 cmap=panel["cmap"],
@@ -1546,54 +1713,54 @@ def run_lag_analysis_grace_rate_pdd(
                 vmin=panel["vmin"],
                 vmax=panel["vmax"],
             )
-            if np.any(sig_best):
-                ax.contour(
-                    data.grace_rate_lon,
-                    data.grace_rate_lat,
-                    sig_overlay,
-                    levels=[0.5],
-                    colors=["black"],
-                    linewidths=0.4,
-                    transform=ccrs.PlateCarree(),
-                )
             ax.add_feature(cfeature.COASTLINE, linewidth=0.7)
             ax.gridlines(alpha=0.3)
         else:
             im = ax.pcolormesh(
-                data.grace_rate_lon,
-                data.grace_rate_lat,
+                target_lon,
+                target_lat,
                 panel["field"],
                 cmap=panel["cmap"],
                 shading="auto",
                 vmin=panel["vmin"],
                 vmax=panel["vmax"],
             )
-            if np.any(sig_best):
-                ax.contour(
-                    data.grace_rate_lon,
-                    data.grace_rate_lat,
-                    sig_overlay,
-                    levels=[0.5],
-                    colors=["black"],
-                    linewidths=0.4,
-                )
             ax.set_aspect("equal")
             ax.set_xlabel("Longitude")
             ax.set_ylabel("Latitude")
 
-        ax.set_title(panel["title"] + "\n(black outline: p < 0.05)")
+        ax.set_title(panel["title"] + "\n(only significant pixels shown: p < 0.05)")
         cbar = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.03)
         cbar.set_label(panel["label"])
 
-    fig.savefig(output_dir / "grace_rate_vs_pdd_lag_analysis_maps.png", dpi=300, bbox_inches="tight")
+    fig.savefig(lag_output_dir / "maps.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    print(
-        "  Saved lag-analysis outputs: "
-        "grace_rate_vs_pdd_lag_analysis_maps.nc, "
-        "grace_rate_vs_pdd_lag_analysis_maps.png"
+    best_summary = pd.DataFrame(
+        {
+            "target_field": [target_label],
+            "driver_field": [driver_label],
+            "best_weighted_lag_months": [float(np.nanmedian(best_lag_map))],
+            "best_weighted_mean_r": [
+                float(np.nansum(best_r_map * np.where(np.isfinite(best_r_map), weights_2d, np.nan))
+                      / np.nansum(np.where(np.isfinite(best_r_map), weights_2d, np.nan)))
+                if np.isfinite(best_r_map).any()
+                else np.nan
+            ],
+            "best_significant_fraction_percent": [
+                float(100.0 * np.sum(np.isfinite(best_p_map) & (best_p_map < 0.05)) / np.sum(np.isfinite(best_p_map)))
+                if np.sum(np.isfinite(best_p_map)) > 0
+                else np.nan
+            ],
+            "max_lag": [max_lag],
+            "min_samples": [min_samples],
+        }
     )
-    #return regional_df
+    best_summary.to_csv(lag_output_dir / "best_lag_summary.csv", index=False)
+
+    print(
+        f"  Saved lag-analysis outputs for {target_label} vs {driver_label}: {lag_output_dir}"
+    )
 
 
 
@@ -1605,7 +1772,7 @@ def main() -> None:
     Research question
     -----------------
     How strongly do Greenland ice-mass anomalies co-vary with regional
-    warming (as measured by Positive Degree Days)?
+    warming?
 
     Analysis pipeline
     -----------------
@@ -1648,21 +1815,35 @@ def main() -> None:
     print(f"  PDD: {pca_data.pdd_data.shape} over {len(pca_data.pdd_dates)} months")
     print(f"  Time range: {pca_data.time_range[0]} to {pca_data.time_range[1]}")
 
-    #run_pca_diagnostics(pca_data, args.output_dir, n_modes=5)
+    run_pca_diagnostics(pca_data, args.output_dir, n_modes=5)
 
-    """run_direct_correlation_grace_rate_pdd(
-        pca_data,
-        args.output_dir,
-        min_samples=24,
-    )"""
 
-    run_lag_analysis_grace_rate_pdd(
-        pca_data,
-        args.output_dir,
-        max_lag=7,
-        min_samples=24,
-    )
+    print("\n=== Direct lag-0 anomaly correlations (4 pairings) ===")
+    lag0_pairs = [
+        ("grace", "temperature"),
+        ("grace", "pdd"),
+        ("grace_rate", "temperature"),
+        ("grace_rate", "pdd"),
+    ]
+    for target_field, driver_field in lag0_pairs:
+        run_direct_correlation_grace_rate_pdd(
+            pca_data,
+            args.output_dir,
+            target_field=target_field,
+            driver_field=driver_field,
+            min_samples=24,
+        )
 
+    print("\n=== Lag analysis anomaly correlations (4 pairings) ===")
+    for target_field, driver_field in lag0_pairs:
+        run_lag_analysis_grace_rate_pdd(
+            pca_data,
+            args.output_dir,
+            target_field=target_field,
+            driver_field=driver_field,
+            max_lag=7,
+            min_samples=24,
+        )
 
 
 
