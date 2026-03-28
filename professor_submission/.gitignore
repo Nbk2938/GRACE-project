@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# Data and large artifacts
+Data/
+outputs/
+*.nc
+*.grib
+*.grb
+*.zip
+*.log
+run_stdout.log
+run_stderr.log
+
+# Editors/OS
+.vscode/
+.DS_Store
+Thumbs.db
